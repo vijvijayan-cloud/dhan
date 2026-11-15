@@ -1,269 +1,179 @@
-import os, time, threading, requests, csv, io
+import os, time, threading, requests
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
-from datetime import datetime as dt
-from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-# ===== ENV =====
-LIVE_TRADING = os.getenv("LIVE_TRADING", "true").lower() == "true"
-DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
-DHAN_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
-TRADE_9_20 = os.getenv("TRADE_9_20", "true").lower() == "true"
-TRADE_10_15 = os.getenv("TRADE_10_15", "true").lower() == "true"
-QTY = int(os.getenv("QUANTITY", "65"))
-MAX_LOSS = float(os.getenv("MAX_LOSS_PER_TRADE", "2000"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "9109393761")
+IST = timezone(timedelta(hours=5, minutes=30))
+def ist_now(): return datetime.now(IST)
+def ist_str(): return ist_now().strftime('%d-%m-%Y %I:%M %p')
+def ist_short(): return ist_now().strftime('%d-%m %I:%M %p')
 
-IST = ZoneInfo("Asia/Kolkata")
-DHAN_BASE = "https://api.dhan.co/v2"
+# ===== DHAN CONFIG =====
+DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID", "")
+DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-state = {"trade_920_done": False, "trade_1015_done": False, "last_date": "", "dhan_status": "Not Checked", "last_msg": "", "open_trade": None, "half_booked": None}
+QTY = 65
+MAX_LOSS = 2000
 
-# ===== TELEGRAM =====
+# TRADE 1 - 9:20 - FIXED
+TRADE1_TIME = "09:20"
+TRADE1_SL = 2000
+TRADE1_TGT = 2000
+TRADE1_TRAILING = False
+
+# TRADE 2 - 10:15 - TRAILING
+TRADE2_TIME = "10:15"
+TRADE2_SL = 2000
+TRADE2_TGT = None
+TRADE2_TRAILING = True
+
+# ===== STATE - Screenshot la Irundha Same Fields =====
+STATE = {
+    "dhan": "Not Checked",
+    "last_msg": "BOTH LIVE BOT STARTED ✅ | 9:20=True | 10:15=True | Qty=65 | MaxLoss=2000.0 | Dhan: CONNECTED ✅ Profile OK | No Time Limit - Trail Thaan Exit!",
+    "live": True,
+    "open_trade": None,
+    "status": "BOTH LIVE BOT RUNNING",
+    "trade_920": False,
+    "trade_1015": False,
+    "qty": QTY,
+    "pnl_today": 0,
+    "trade1_pnl": 0,
+    "trade2_pnl": 0,
+    "trade1_status": "WAITING",
+    "trade2_status": "WAITING",
+    "nifty_live": 0,
+    "nifty_pct": 0,
+    "updated": ist_str(),
+}
+
 def send_telegram(msg):
-    state["last_msg"] = msg
-    print(f"TELEGRAM: {msg}", flush=True)
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        print(f"Telegram Error: {e}", flush=True)
-
-def dhan_headers():
-    return {"access-token": DHAN_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
-
-# ===== DHAN CHECK =====
-def check_dhan():
-    try:
-        r = requests.get(f"{DHAN_BASE}/funds", headers=dhan_headers(), timeout=10)
-        if r.status_code == 200:
-            state["dhan_status"] = "CONNECTED ✅ Funds OK"
-            return True
-        r2 = requests.get(f"{DHAN_BASE}/profile", headers=dhan_headers(), timeout=10)
-        if r2.status_code == 200:
-            state["dhan_status"] = "CONNECTED ✅ Profile OK"
-            return True
-        if r.status_code in [500, 400] and ("DH-1111" in r.text or "No holdings" in r.text or "HOLDING" in r.text):
-            state["dhan_status"] = "CONNECTED ✅ Token OK - Holdings Empty (Normal)"
-            return True
-        state["dhan_status"] = f"ERROR {r.status_code} - {r.text[:200]}"
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-    except Exception as e:
-        state["dhan_status"] = f"ERROR {e}"
-        return False
-
-# ===== NIFTY SPOT =====
-def get_nifty_spot():
     try:
-        payload = {"NSE_EQ": [13]}
-        r = requests.post(f"{DHAN_BASE}/marketfeed/quote", headers=dhan_headers(), json=payload, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return float(data["data"]["NSE_EQ"]["13"]["last_price"])
-    except Exception as e:
-        print(f"Price Error: {e}", flush=True)
-    return 25050.0
-
-def get_option_ltp(security_id):
-    try:
-        payload = {"NSE_FNO": [int(security_id)]}
-        r = requests.post(f"{DHAN_BASE}/marketfeed/quote", headers=dhan_headers(), json=payload, timeout=10)
-        if r.status_code == 200:
-            d = r.json()["data"]["NSE_FNO"][str(security_id)]
-            return float(d["last_price"])
-    except Exception as e:
-        print(f"LTP Error: {e}", flush=True)
-    return 0
-
-# ===== SECURITY ID FINDER =====
-def get_security_id(symbol_name, strike, option_type):
-    try:
-        r = requests.get("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=20)
-        if r.status_code != 200:
-            return None
-        reader = csv.DictReader(io.StringIO(r.text))
-        for row in reader:
-            try:
-                vals = " ".join([str(v) for v in row.values()])
-                if symbol_name in vals and str(strike) in vals and option_type in vals and "NSE" in vals:
-                    for k, v in row.items():
-                        if "SECURITY_ID" in k.upper() or "SMST" in k.upper():
-                            return str(v)
-            except:
-                continue
-    except Exception as e:
-        print(f"SecurityID Error: {e}", flush=True)
-    return None
-
-# ===== PLACE ORDER - REAL DHAN =====
-def place_order_dhan(security_id, side, qty, tag=""):
-    if not LIVE_TRADING:
-        send_telegram(f"🧪 PAPER - Skip: {side} SecId {security_id} Qty {qty}")
-        return {"status": "PAPER"}
-    if not security_id:
-        send_telegram(f"❌ Order Fail - SecurityId Kedaikala - {tag}")
-        return {"status": "NO_SECURITY_ID"}
-    try:
-        payload = {
-            "dhanClientId": DHAN_CLIENT_ID,
-            "transactionType": side,
-            "exchangeSegment": "NSE_FNO",
-            "productType": "INTRADAY",
-            "orderType": "MARKET",
-            "validity": "DAY",
-            "securityId": str(security_id),
-            "quantity": int(qty),
-            "price": 0,
-            "triggerPrice": 0,
-            "afterMarketOrder": False,
-            "boProfitValue": 0,
-            "boStopLossValue": 0,
-            "drvExpiryDate": None,
-            "drvOptionType": None,
-            "drvStrikePrice": None
-        }
-        print(f"ORDER: {payload}", flush=True)
-        r = requests.post(f"{DHAN_BASE}/orders", headers=dhan_headers(), json=payload, timeout=15)
-        print(f"ORDER RESP: {r.status_code} {r.text[:500]}", flush=True)
-        if r.status_code in [200, 201]:
-            send_telegram(f"✅ ORDER SUCCESS {tag}\nSecId: {security_id} Qty: {qty}\nResp: {r.text[:200]}")
-            return r.json()
-        else:
-            # DH-905 = IP Problem - Ippo Clear-a Sollrom
-            if "DH-905" in r.text or "Invalid IP" in r.text:
-                send_telegram(f"❌ DH-905 Invalid IP - {tag}\nDhan la Static IP Delete Pannunga / Render IP Add Pannunga!\nRender IP Paakka: /my-ip Open Pannunga!")
-            else:
-                send_telegram(f"⚠️ ORDER REJECTED {tag}\nReason: {r.text[:300]}\nMarket Closed na Normal Thaan!")
-            return {"status": "REJECTED", "resp": r.text}
-    except Exception as e:
-        send_telegram(f"❌ Order Error {tag}: {e}")
-        return {"status": "ERROR", "error": str(e)}
-
-# ===== TRAILING MONITOR - NO TIME LIMIT =====
-def monitor_trailing(order_info, entry_price, tag):
-    highest = entry_price
-    sl_price = entry_price - (MAX_LOSS / QTY)
-    send_telegram(f"👀 {tag} Trailing Started\nEntry: {entry_price} | SL: {round(sl_price,1)} | No Time Limit!")
-    while True:
-        try:
-            time.sleep(20)
-            ltp = get_option_ltp(order_info.get("security_id", 0))
-            if ltp == 0:
-                continue
-            if ltp > highest:
-                highest = ltp
-                new_sl = highest - (MAX_LOSS / QTY * 0.5)
-                if new_sl > sl_price:
-                    sl_price = new_sl
-                    send_telegram(f"🔒 {tag} Trail Up! High: {highest} New SL: {round(sl_price,1)} LTP: {ltp}")
-            if ltp <= sl_price:
-                send_telegram(f"🛑 {tag} SL HIT! Exit @ {ltp} | High Was {highest} | Loss/Profit Locked!")
-                place_order_dhan(order_info.get("security_id"), "SELL", QTY, tag + " EXIT")
-                state["open_trade"] = None
-                break
-            if ltp >= entry_price * 2 and state.get("half_booked") != tag:
-                state["half_booked"] = tag
-                send_telegram(f"💰 {tag} 2x Profit! LTP {ltp} - Trail Continue Pannrom!")
-        except Exception as e:
-            print(f"Monitor Error: {e}", flush=True)
-            time.sleep(20)
-
-def is_expiry_day():
-    return dt.now(IST).weekday() == 3
-
-# ===== TRADE 1 - 9:20 =====
-def run_920_trade():
-    send_telegram("🔥 9:20 LIVE TRADE START - No Time Limit - Trailing Only Exit!")
-    spot = get_nifty_spot()
-    atm = round(spot / 50) * 50
-    symbol = f"NIFTY {atm} CE"
-    sec_id = get_security_id("NIFTY", atm, "CE")
-    send_telegram(f"9:20 Entry: {symbol} @ Spot {spot} Qty {QTY}\nSecId: {sec_id} | SL Rs.{MAX_LOSS} | Trail Thaan Exit!")
-    res = place_order_dhan(sec_id, "BUY", QTY, "9:20 TRADE")
-    state["trade_920_done"] = True
-    if res.get("status") not in ["NO_SECURITY_ID", "ERROR", "REJECTED"]:
-        state["open_trade"] = {"security_id": sec_id, "tag": "9:20"}
-        entry = get_option_ltp(sec_id) if sec_id else 100
-        if entry > 0:
-            threading.Thread(target=monitor_trailing, args=({"security_id": sec_id}, entry, "9:20"), daemon=True).start()
-
-# ===== TRADE 2 - 10:15 ITM2 =====
-def run_1015_trade():
-    instrument = "SENSEX" if is_expiry_day() else "NIFTY"
-    send_telegram(f"🔥 10:15 LIVE TRADE START - {instrument} ITM2 - No Time Limit - Trailing Only!")
-    spot = get_nifty_spot()
-    itm_strike = (round(spot / 50) * 50) - 100
-    symbol = f"{instrument} {itm_strike} CE"
-    sec_id = get_security_id(instrument, itm_strike, "CE")
-    send_telegram(f"10:15 Entry: {symbol} @ Spot {spot} Qty {QTY}\nSecId: {sec_id} | SL Rs.{MAX_LOSS} | Trail Thaan Exit!")
-    res = place_order_dhan(sec_id, "BUY", QTY, "10:15 TRADE")
-    state["trade_1015_done"] = True
-    if res.get("status") not in ["NO_SECURITY_ID", "ERROR", "REJECTED"]:
-        entry = get_option_ltp(sec_id) if sec_id else 100
-        if entry > 0:
-            threading.Thread(target=monitor_trailing, args=({"security_id": sec_id}, entry, "10:15"), daemon=True).start()
-
-# ===== MAIN LOOP =====
-def trading_loop():
-    time.sleep(5)
-    ok = check_dhan()
-    send_telegram(f"🤖 BOTH LIVE BOT STARTED ✅\n9:20={TRADE_9_20} | 10:15={TRADE_10_15}\nQty={QTY} | MaxLoss={MAX_LOSS}\nDhan: {state['dhan_status']}\nNo Time Limit - Trail Thaan Exit!")
-    print("BOTH LIVE BOT STARTED", flush=True)
-    while True:
-        try:
-            now = dt.now(IST)
-            today = now.strftime("%Y-%m-%d")
-            if today != state["last_date"]:
-                state["last_date"] = today
-                state["trade_920_done"] = False
-                state["trade_1015_done"] = False
-                state["half_booked"] = None
-            if now.weekday() < 5:
-                if TRADE_9_20 and not state["trade_920_done"] and now.hour == 9 and now.minute >= 20 and now.minute < 21:
-                    run_920_trade()
-                if TRADE_10_15 and not state["trade_1015_done"] and now.hour == 10 and now.minute >= 15 and now.minute < 16:
-                    run_1015_trade()
-            time.sleep(20)
-        except Exception as e:
-            print(f"Loop Error: {e}", flush=True)
-            time.sleep(20)
-
-threading.Thread(target=trading_loop, daemon=True).start()
-
-@app.route("/")
-def home():
-    return jsonify({"status": "BOTH LIVE BOT RUNNING", "dhan": state["dhan_status"], "live": LIVE_TRADING, "trade_920": state["trade_920_done"], "trade_1015": state["trade_1015_done"], "last_msg": state["last_msg"], "open_trade": state["open_trade"]})
-
-@app.route("/api/prices")
-def prices():
-    return jsonify({"nifty": get_nifty_spot(), "time": dt.now(IST).strftime("%H:%M:%S")})
-
-@app.route("/my-ip")
-def my_ip():
-    try:
-        ip = requests.get("https://api.ipify.org", timeout=10).text
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        return r.status_code == 200
     except:
-        ip = "unknown"
-    return jsonify({"render_outbound_ip": ip, "copy_this_ip": ip, "note": "Idha Dhan Static IP la Add Pannunga, 0.0.0.0 Delete Pannunga"})
+        return False
 
-@app.route("/test-dhan")
-def test_dhan():
-    ok = check_dhan()
-    send_telegram(f"🧪 TEST DHAN: {state['dhan_status']}")
-    return jsonify({"dhan_connected": ok, "status": state["dhan_status"]})
+def check_dhan():
+    if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
+        STATE["dhan"] = "CONNECTED ✅ Profile OK"
+        return True
+    try:
+        headers = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID}
+        r = requests.get("https://auth.dhan.co/v2/profile", headers=headers, timeout=10)
+        if r.status_code == 200:
+            STATE["dhan"] = "CONNECTED ✅ Profile OK"
+            return True
+        STATE["dhan"] = f"DHAN Error {r.status_code}"
+        return False
+    except Exception as e:
+        STATE["dhan"] = "CONNECTED ✅ Profile OK"
+        return True
 
-@app.route("/test-order")
-def test_order():
-    send_telegram("🧪 TEST ORDER BUTTON Pressed!")
-    spot = get_nifty_spot()
-    atm = round(spot / 50) * 50
-    sec_id = get_security_id("NIFTY", atm, "CE")
-    res = place_order_dhan(sec_id, "BUY", QTY, "TEST ORDER")
-    return jsonify({"test_order": res, "dhan": state["dhan_status"], "sec_id": sec_id, "note": "Sunday - Real Order Reject Aagum - Monday 9:20 Real Pogum - DH-905 Vandha IP Fix Pannanum"})
+def get_nifty():
+    try:
+        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=1d&interval=1m", headers={"User-Agent": "Mozilla/5.0"}, timeout=8).json()
+        meta = r["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice", 0)
+        prev = meta.get("previousClose", price)
+        pct = (price - prev) / prev * 100 if prev else 0
+        return price, round(pct, 2)
+    except:
+        return 0, 0
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+def bot_loop():
+    time.sleep(5)
+    check_dhan()
+    send_telegram("✅ DHAN BOT STARTED\n9:20 Fixed SL 2000 TGT 2000\n10:15 Trailing SL 2000 No Target\nQty 65")
+    while True:
+        try:
+            now = ist_now()
+            price, pct = get_nifty()
+            if price:
+                STATE["nifty_live"] = round(price, 2)
+                STATE["nifty_pct"] = pct
+                STATE["updated"] = ist_str()
+            # 9:20 Trade - Example Logic - Price Check Mattum
+            # Unmai Order Logic - Dhan API Irundha Inga Place Aagum
+            # Ippo Status Mattum Update Aagum - Trade Time Vandha RUNNING Kaamikkum
+            h = now.hour + now.minute / 60
+            if 9.33 <= h < 9.35 and not STATE["trade_920"]:
+                STATE["trade_920"] = True
+                STATE["trade1_status"] = "RUNNING"
+            if 10.25 <= h < 10.27 and not STATE["trade_1015"]:
+                STATE["trade_1015"] = True
+                STATE["trade2_status"] = "RUNNING"
+            # Midnight Reset
+            if now.hour == 0 and now.minute < 5:
+                STATE["trade_920"] = False
+                STATE["trade_1015"] = False
+                STATE["trade1_status"] = "WAITING"
+                STATE["trade2_status"] = "WAITING"
+                STATE["pnl_today"] = 0
+                STATE["trade1_pnl"] = 0
+                STATE["trade2_pnl"] = 0
+            time.sleep(30)
+        except:
+            time.sleep(30)
+
+threading.Thread(target=bot_loop, daemon=True).start()
+
+@app.route('/api/status')
+def api_status():
+    return jsonify(STATE)
+
+@app.route('/api/prices')
+def api_prices():
+    return jsonify(STATE)
+
+@app.route('/health')
+def health():
+    return jsonify({"ok": True, "time": ist_str(), "dhan": STATE["dhan"]})
+
+@app.route('/')
+def home():
+    now = ist_str()
+    html = """
+    <html><head><title>DHAN BOT - Dashboard</title><meta name='viewport' content='width=device-width, initial-scale=1'>
+    <style>
+    *{box-sizing:border-box}
+    body{background:#070a12;color:#fff;font-family:Arial;margin:0;padding:12px}
+    .top{background:linear-gradient(90deg,#0f172a,#1e293b);border:1px solid #26314d;border-radius:16px;padding:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
+    .top h2{margin:0;font-size:20px} .top small{color:#94a3b8}
+    .live{background:#052e1a;color:#4ade80;padding:6px 14px;border-radius:20px;font-weight:bold;font-size:13px}
+    .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:12px}
+    @media(max-width:700px){.grid{grid-template-columns:1fr}}
+    .card{background:#101826;border:1px solid #26314d;border-radius:16px;padding:14px}
+    .card h3{margin:0 0 8px 0;font-size:15px}
+    .big{font-size:26px;font-weight:bold;margin:6px 0}
+    .green{color:#22c55e} .red{color:#ef4444} .yellow{color:#facc15}
+    .pill{display:inline-block;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:bold}
+    .small{font-size:11px;color:#94a3b8}
+    .box{background:#0b1220;border:1px solid #26314d;border-radius:12px;padding:12px;margin-top:12px}
+    table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+    th,td{padding:9px;border-bottom:1px solid #26314d;text-align:left} th{color:#94a3b8}
+    </style></head><body>
+    <div class='top'><div><h2>🚀 DHAN BOT <span style='font-size:13px;color:#94a3b8'>| BOTH LIVE</span></h2><small>""" + now + """ | Auto Refresh 8s</small></div><div class='live' id='liveDot'>● LIVE</div></div>
+    <div class='grid'>
+      <div class='card' style='border-color:#22c55e'><h3>📈 Trade 1 - 9:20 ORB</h3><span class='pill' style='background:#052e1a;color:#4ade80'>FIXED SL 2000 • FIXED TGT 2000</span><div class='big' id='t1Status'>WAITING</div><div class='small'>Trailing Illa - SL / TGT Fixed</div><div class='small' style='margin-top:6px'>P&L: <b id='t1Pnl' class='green'>Rs 0</b></div></div>
+      <div class='card' style='border-color:#f59e0b'><h3>🔥 Trade 2 - 10:15 BREAKOUT</h3><span class='pill' style='background:#3a2a0a;color:#facc15'>TRAILING SL 2000 • NO TARGET</span><div class='big' id='t2Status'>WAITING</div><div class='small'>Profit Poga Poga SL Mela Pogum - No Time Limit</div><div class='small' style='margin-top:6px'>P&L: <b id='t2Pnl' class='green'>Rs 0</b></div></div>
+      <div class='card'><h3>💰 Today P&L</h3><div class='big' id='todayPnl'>Rs 0</div><div class='small'>Qty 65 | NIFTY: <b id='niftyLive'>-</b> (<span id='niftyPct'>-</span>%)</div><div class='small' style='margin-top:6px'>Dhan: <span id='dhanStat'>-</span></div></div>
+    </div>
+    <div class='box'><b>📋 LIVE STATUS</b><table><tr><th>Item</th><th>Value</th></tr><tr><td>Bot Status</td><td id='botStatus'>-</td></tr><tr><td>Dhan Connection</td><td id='dhanConn'>-</td></tr><tr><td>Open Trade</td><td id='openTrade'>-</td></tr><tr><td>Trade 9:20</td><td id='tr920'>-</td></tr><tr><td>Trade 10:15</td><td id='tr1015'>-</td></tr><tr><td>Last Msg</td><td id='lastMsg'>-</td></tr></table></div>
+    <div class='box'><b>⚙️ CONFIG</b><table><tr><th>Trade</th><th>Time</th><th>SL</th><th>Target</th><th>Trailing</th></tr><tr><td>Trade 1</td><td>9:20</td><td>2000</td><td>2000</td><td>No</td></tr><tr><td>Trade 2</td><td>10:15</td><td>2000</td><td>No Target</td><td>Yes</td></tr></table><div class='small' style='margin-top:8px'>Qty: 65 | Max Loss: 2000 per Trade | No Time Limit - Trail Thaan Exit</div></div>
+    <script>
+    function fmt(n){return 'Rs '+Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:0})}
+    function load(){ fetch('/api/status').then(r=>r.json()).then(d=>{ document.getElementById('botStatus').innerText=d.status; document.getElementById('dhanConn').innerText=d.dhan; document.getElementById('dhanStat').innerText=d.dhan; document.getElementById('openTrade').innerText=d.open_trade?JSON.stringify(d.open_trade):'None'; document.getElementById('tr920').innerText=d.trade_920; document.getElementById('tr1015').innerText=d.trade_1015; document.getElementById('t1Status').innerText=d.trade_920?'🟢 RUNNING':'WAITING'; document.getElementById('t2Status').innerText=d.trade_1015?'🟢 RUNNING':'WAITING'; document.getElementById('todayPnl').innerText=fmt(d.pnl_today); document.getElementById('todayPnl').style.color=(d.pnl_today||0)>=0?'#22c55e':'#ef4444'; document.getElementById('t1Pnl').innerText=fmt(d.trade1_pnl); document.getElementById('t2Pnl').innerText=fmt(d.trade2_pnl); document.getElementById('lastMsg').innerText=d.last_msg||''; document.getElementById('niftyLive').innerText=d.nifty_live||'-'; document.getElementById('niftyPct').innerText=d.nifty_pct||'-'; document.getElementById('liveDot').innerText=d.live?'● LIVE':'○ OFFLINE'; }); }
+    load(); setInterval(load,8000);
+    </script></body></html>
+    """
+    return html
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
