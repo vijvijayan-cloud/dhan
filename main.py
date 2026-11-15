@@ -177,3 +177,51 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+@app.route('/test-order')
+def test_order():
+    import requests
+    # Dhan la - Market Closed-na Kooda - Connection Test Pannalam
+    # 1 Qty - NIFTY - Test Order - Reject Aanaalum OK
+    try:
+        headers = {
+            "access-token": DHAN_ACCESS_TOKEN,
+            "client-id": DHAN_CLIENT_ID,
+            "Content-Type": "application/json"
+        }
+        # Dhan Profile Check - First
+        r1 = requests.get("https://auth.dhan.co/v2/profile", headers=headers, timeout=10)
+        profile = r1.text[:300]
+
+        # Test Order - Market Closed-na Reject Aagum - Parava Illa
+        # Order Place Try Pannuvom - Dhan Enna Solrannu Paapom
+        order_data = {
+            "dhanClientId": DHAN_CLIENT_ID,
+            "transactionType": "BUY",
+            "exchangeSegment": "NSE_FNO",
+            "productType": "INTRADAY",
+            "orderType": "MARKET",
+            "validity": "DAY",
+            "securityId": "13",  # NIFTY FUTURE Test
+            "quantity": 15,
+            "disclosedQuantity": 0,
+            "price": 0,
+            "triggerPrice": 0,
+            "afterMarketOrder": False,
+            "boProfitValue": 0,
+            "boStopLossValue": 0,
+            "drvExpiryDate": None,
+            "drvOptionType": None,
+            "drvStrikePrice": None
+        }
+        r2 = requests.post("https://auth.dhan.co/v2/orders", headers=headers, json=order_data, timeout=10)
+        return jsonify({
+            "test": "DHAN LIVE TEST",
+            "time": ist_str(),
+            "profile_status": r1.status_code,
+            "profile": profile,
+            "order_status": r2.status_code,
+            "order_response": r2.text[:500],
+            "meaning": "Order Reject Aanaalum - Profile 200 Vandha - Connection OK ✅ | Market Closed-nu Vandha - Normal ✅"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
