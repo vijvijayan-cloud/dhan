@@ -20,18 +20,24 @@ DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-QTY = 15
+# NIFTY LOT SIZE = 65 - UPDATED ✅
+LOT_SIZE = 65
+QTY = 65
+NO_OF_LOTS = 1
+TOTAL_QTY = LOT_SIZE * NO_OF_LOTS
 MAX_LOSS = 2000
 
 STATE = {}
 STATE["dhan"] = "CONNECTED ✅"
-STATE["last_msg"] = "BOTH LIVE BOT STARTED ✅ | Qty 15 | 9:20=True | 10:15=True"
+STATE["last_msg"] = "BOTH LIVE BOT STARTED ✅ | Lot 65 x 1 Lot = 65 Qty | 9:20=True | 10:15=True"
 STATE["live"] = True
 STATE["open_trade"] = None
 STATE["status"] = "BOTH LIVE BOT RUNNING"
 STATE["trade_920"] = False
 STATE["trade_1015"] = False
-STATE["qty"] = QTY
+STATE["qty"] = TOTAL_QTY
+STATE["lot_size"] = LOT_SIZE
+STATE["no_of_lots"] = NO_OF_LOTS
 STATE["pnl_today"] = 0
 STATE["trade1_pnl"] = 0
 STATE["trade2_pnl"] = 0
@@ -127,16 +133,16 @@ def bot_loop():
             h = now.hour + now.minute / 60
             if 9.33 <= h < 9.35 and not STATE["trade_920"]:
                 STATE["trade_920"] = True
-                STATE["last_msg"] = "9:20 TRADE TRIGGERED | NIFTY " + str(price)
-                code, resp = place_dhan_order("BUY", QTY, "9:20")
-                STATE["last_msg"] = "9:20 ORDER TRIED | Code " + str(code) + " | " + resp[:200]
-                send_telegram("DHAN 9:20 TRADE | Code " + str(code) + " | " + resp[:200])
+                STATE["last_msg"] = "9:20 TRADE TRIGGERED | NIFTY " + str(price) + " | QTY " + str(TOTAL_QTY)
+                code, resp = place_dhan_order("BUY", TOTAL_QTY, "9:20")
+                STATE["last_msg"] = "9:20 ORDER TRIED | Code " + str(code) + " | QTY " + str(TOTAL_QTY) + " | " + resp[:200]
+                send_telegram("DHAN 9:20 TRADE | QTY " + str(TOTAL_QTY) + " | Code " + str(code) + " | " + resp[:200])
             if 10.25 <= h < 10.27 and not STATE["trade_1015"]:
                 STATE["trade_1015"] = True
-                STATE["last_msg"] = "10:15 TRADE TRIGGERED | NIFTY " + str(price)
-                code, resp = place_dhan_order("BUY", QTY, "10:15")
-                STATE["last_msg"] = "10:15 ORDER TRIED | Code " + str(code) + " | " + resp[:200]
-                send_telegram("DHAN 10:15 TRADE | Code " + str(code) + " | " + resp[:200])
+                STATE["last_msg"] = "10:15 TRADE TRIGGERED | NIFTY " + str(price) + " | QTY " + str(TOTAL_QTY)
+                code, resp = place_dhan_order("BUY", TOTAL_QTY, "10:15")
+                STATE["last_msg"] = "10:15 ORDER TRIED | Code " + str(code) + " | QTY " + str(TOTAL_QTY) + " | " + resp[:200]
+                send_telegram("DHAN 10:15 TRADE | QTY " + str(TOTAL_QTY) + " | Code " + str(code) + " | " + resp[:200])
             if now.hour == 0 and now.minute < 5:
                 STATE["trade_920"] = False
                 STATE["trade_1015"] = False
@@ -162,7 +168,9 @@ def test_order():
         result["time"] = ist_str()
         result["funds_status"] = code
         result["funds"] = txt
-        result["note"] = "200 = Token OK ✅ | 401 = Token Expired - Pudhu Token Pottanum | 403 = IP Whitelist Problem"
+        result["lot_size"] = LOT_SIZE
+        result["qty"] = TOTAL_QTY
+        result["note"] = "200 = Token OK | 401 = Token Expired - Pudhu Token Pottanum"
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -195,11 +203,11 @@ def home():
     html += "</style></head><body>"
     html += "<div class='top'><div><h2 style='margin:0'>🚀 DHAN BOT <span style='font-size:13px;color:#94a3b8'>| BOTH LIVE</span></h2><small>" + now + "</small></div><div class='live'>● LIVE</div></div>"
     html += "<div class='grid'>"
-    html += "<div class='card' style='border-color:#22c55e'><h3>📈 Trade 1 - 9:20 ORB</h3><span class='pill' style='background:#052e1a;color:#4ade80'>FIXED SL 2000 • TGT 2000</span><div class='big' id='t1Status'>WAITING</div><div class='small'>P&L: <b id='t1Pnl'>Rs 0</b></div></div>"
-    html += "<div class='card' style='border-color:#f59e0b'><h3>🔥 Trade 2 - 10:15 BREAKOUT</h3><span class='pill' style='background:#3a2a0a;color:#facc15'>TRAILING SL 2000 • NO TARGET</span><div class='big' id='t2Status'>WAITING</div><div class='small'>P&L: <b id='t2Pnl'>Rs 0</b></div></div>"
-    html += "<div class='card'><h3>💰 Today P&L</h3><div class='big' id='todayPnl'>Rs 0</div><div class='small'>Qty 15 | NIFTY: <b id='niftyLive'>-</b> (<span id='niftyPct'>-</span>%)</div><div class='small'>Dhan: <span id='dhanStat'>-</span></div></div>"
+    html += "<div class='card' style='border-color:#22c55e'><h3>📈 Trade 1 - 9:20 ORB</h3><span class='pill' style='background:#052e1a;color:#4ade80'>LOT 65 x 1 | FIXED SL 2000 • TGT 2000</span><div class='big' id='t1Status'>WAITING</div><div class='small'>P&L: <b id='t1Pnl'>Rs 0</b></div></div>"
+    html += "<div class='card' style='border-color:#f59e0b'><h3>🔥 Trade 2 - 10:15 BREAKOUT</h3><span class='pill' style='background:#3a2a0a;color:#facc15'>LOT 65 x 1 | TRAILING SL 2000 • NO TARGET</span><div class='big' id='t2Status'>WAITING</div><div class='small'>P&L: <b id='t2Pnl'>Rs 0</b></div></div>"
+    html += "<div class='card'><h3>💰 Today P&L</h3><div class='big' id='todayPnl'>Rs 0</div><div class='small'>Qty 65 (Lot 65 x 1) | NIFTY: <b id='niftyLive'>-</b> (<span id='niftyPct'>-</span>%)</div><div class='small'>Dhan: <span id='dhanStat'>-</span></div></div>"
     html += "</div>"
-    html += "<div class='box'><b>📋 LIVE STATUS</b><table><tr><th>Item</th><th>Value</th></tr><tr><td>Bot Status</td><td id='botStatus'>-</td></tr><tr><td>Dhan</td><td id='dhanConn'>-</td></tr><tr><td>Open Trade</td><td id='openTrade'>-</td></tr><tr><td>Trade 9:20</td><td id='tr920'>-</td></tr><tr><td>Trade 10:15</td><td id='tr1015'>-</td></tr><tr><td>Last Order</td><td id='lastOrder'>-</td></tr><tr><td>Last Msg</td><td id='lastMsg'>-</td></tr></table></div>"
+    html += "<div class='box'><b>📋 LIVE STATUS</b><table><tr><th>Item</th><th>Value</th></tr><tr><td>Bot Status</td><td id='botStatus'>-</td></tr><tr><td>Dhan</td><td id='dhanConn'>-</td></tr><tr><td>Lot Size</td><td>65</td></tr><tr><td>Qty</td><td>65 (1 Lot)</td></tr><tr><td>Open Trade</td><td id='openTrade'>-</td></tr><tr><td>Trade 9:20</td><td id='tr920'>-</td></tr><tr><td>Trade 10:15</td><td id='tr1015'>-</td></tr><tr><td>Last Order</td><td id='lastOrder'>-</td></tr><tr><td>Last Msg</td><td id='lastMsg'>-</td></tr></table></div>"
     html += "<div class='box'><a href='/test-order'>👉 CLICK HERE - TEST DHAN CONNECTION</a></div>"
     html += "<script>"
     html += "function fmt(n){return 'Rs '+Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:0})}"
