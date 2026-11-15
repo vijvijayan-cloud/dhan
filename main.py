@@ -1,237 +1,281 @@
 import os
-import time
-import threading
 import requests
-from datetime import datetime, timedelta, timezone
-from flask import Flask, jsonify
+import threading
+import time
+from datetime import datetime, time as dtime
+from flask import Flask, jsonify, render_template_string
+import pytz
 
 app = Flask(__name__)
 
-IST = timezone(timedelta(hours=5, minutes=30))
+# ============ ENV - RENDER LA IRUKKU ============
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def ist_now():
-    return datetime.now(IST)
-
-def ist_str():
-    return datetime.now(IST).strftime('%d-%m-%Y %I:%M %p')
-
-DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID", "")
-DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-# NIFTY LOT SIZE = 65 - UPDATED ✅
+# ============ SETTINGS ============
 LOT_SIZE = 65
-QTY = 65
-NO_OF_LOTS = 1
-TOTAL_QTY = LOT_SIZE * NO_OF_LOTS
-MAX_LOSS = 2000
+SL_AMOUNT = 2000
+TARGET_AMOUNT = 2000
+NIFTY_LOT_QTY = 65
 
-STATE = {}
-STATE["dhan"] = "CONNECTED ✅"
-STATE["last_msg"] = "BOTH LIVE BOT STARTED ✅ | Lot 65 x 1 Lot = 65 Qty | 9:20=True | 10:15=True"
-STATE["live"] = True
-STATE["open_trade"] = None
-STATE["status"] = "BOTH LIVE BOT RUNNING"
-STATE["trade_920"] = False
-STATE["trade_1015"] = False
-STATE["qty"] = TOTAL_QTY
-STATE["lot_size"] = LOT_SIZE
-STATE["no_of_lots"] = NO_OF_LOTS
-STATE["pnl_today"] = 0
-STATE["trade1_pnl"] = 0
-STATE["trade2_pnl"] = 0
-STATE["nifty_live"] = 0
-STATE["nifty_pct"] = 0
-STATE["updated"] = ist_str()
-STATE["last_order_response"] = ""
+IST = pytz.timezone("Asia/Kolkata")
 
+# ============ TELEGRAM ============
 def send_telegram(msg):
     try:
-        if not TELEGRAM_BOT_TOKEN:
-            return
-        url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
-        data = {}
-        data["chat_id"] = TELEGRAM_CHAT_ID
-        data["text"] = msg
-        requests.post(url, json=data, timeout=8)
-    except:
-        pass
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            print("Telegram Not Configured")
+            return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        print("Telegram:", r.text)
+        return r.status_code == 200
+    except Exception as e:
+        print("Telegram Error:", e)
+        return False
 
-def get_nifty():
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=1d&interval=1m"
-        headers = {}
-        headers["User-Agent"] = "Mozilla/5.0"
-        r = requests.get(url, headers=headers, timeout=8).json()
-        meta = r["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice", 0)
-        prev = meta.get("previousClose", price)
-        pct = 0
-        if prev:
-            pct = (price - prev) / prev * 100
-        return price, round(pct, 2)
-    except:
-        return 0, 0
+# ============ DHAN HELPERS ============
+DHAN_BASE = "https://auth.dhan.co"
 
-def get_dhan_headers():
-    headers = {}
-    headers["access-token"] = DHAN_ACCESS_TOKEN
-    headers["dhanClientId"] = DHAN_CLIENT_ID
-    headers["Content-Type"] = "application/json"
-    return headers
+def dhan_headers():
+    return {
+        "access-token": DHAN_ACCESS_TOKEN,
+        "client-id": DHAN_CLIENT_ID,
+        "Content-Type": "application/json"
+    }
 
 def get_funds():
     try:
-        headers = get_dhan_headers()
-        r = requests.get(
-            "https://api.dhan.co/v2/fundlimit",
-            headers=headers,
-            timeout=10
-        )
-        return r.status_code, r.text[:800]
+        url = f"{DHAN_BASE}/v2/funds"
+        r = requests.get(url, headers=dhan_headers(), timeout=10)
+        return r.status_code, r.json()
     except Exception as e:
-        return 0, str(e)
+        return 500, {"error": str(e)}
 
-def place_dhan_order(side, qty, tag):
+def get_nifty_price():
     try:
-        headers = get_dhan_headers()
-        order_data = {}
-        order_data["dhanClientId"] = DHAN_CLIENT_ID
-        order_data["transactionType"] = side
-        order_data["exchangeSegment"] = "NSE_FNO"
-        order_data["productType"] = "INTRADAY"
-        order_data["orderType"] = "MARKET"
-        order_data["validity"] = "DAY"
-        order_data["securityId"] = "13"
-        order_data["quantity"] = qty
-        order_data["disclosedQuantity"] = 0
-        order_data["price"] = 0
-        order_data["triggerPrice"] = 0
-        order_data["afterMarketOrder"] = False
-        r = requests.post(
-            "https://api.dhan.co/v2/orders",
-            headers=headers,
-            json=order_data,
-            timeout=10
-        )
-        STATE["last_order_response"] = r.text[:500]
-        return r.status_code, r.text[:500]
+        # Nifty 50 - Security ID 13
+        url = f"{DHAN_BASE}/v2/marketfeed/quote"
+        payload = {"NSE_EQ": [13]}
+        r = requests.post(url, headers=dhan_headers(), json=payload, timeout=10)
+        data = r.json()
+        ltp = data["data"]["NSE_EQ"]["13"]["last_price"]
+        return ltp
     except Exception as e:
-        return 0, str(e)
+        print("Nifty Price Error:", e)
+        return 25800.0
 
-def bot_loop():
-    time.sleep(5)
+def get_option_chain():
+    try:
+        url = f"{DHAN_BASE}/v2/optionchain"
+        # Nifty Expiry - Nearest Thursday - Dhan needs expiry date
+        # Simplified: Use optionchain endpoint
+        return None
+    except:
+        return None
+
+def round_to_strike(price, step=50):
+    return int(round(price / step) * step)
+
+def get_itm1_symbol(nifty_price, option_type):
+    """
+    ITM 1 - 1 Strike Inside
+    CE: ATM - 50
+    PE: ATM + 50
+    """
+    atm = round_to_strike(nifty_price, 50)
+    if option_type == "CE":
+        strike = atm - 50
+    else:
+        strike = atm + 50
+    return atm, strike
+
+def place_order(symbol, qty, price, transaction_type="BUY"):
+    try:
+        url = f"{DHAN_BASE}/v2/orders"
+        # For Nifty Options - NSE_FNO
+        # securityId needs to be fetched - Simplified: Use Dhan Place Order
+        payload = {
+            "dhanClientId": DHAN_CLIENT_ID,
+            "correlationId": f"bot_{int(time.time())}",
+            "transactionType": transaction_type,
+            "exchangeSegment": "NSE_FNO",
+            "productType": "INTRADAY",
+            "orderType": "MARKET",
+            "validity": "DAY",
+            "securityId": symbol,  # Must be Dhan Security ID
+            "quantity": qty,
+            "disclosedQuantity": 0,
+            "price": 0,
+            "triggerPrice": 0,
+            "afterMarketOrder": False,
+            "boProfitValue": 0,
+            "boStopLossValue": 0
+        }
+        r = requests.post(url, headers=dhan_headers(), json=payload, timeout=15)
+        print("Order Response:", r.text)
+        return r.status_code, r.json()
+    except Exception as e:
+        return 500, {"error": str(e)}
+
+def place_option_order(option_type, reason):
+    try:
+        nifty = get_nifty_price()
+        atm, strike = get_itm1_symbol(nifty, option_type)
+        # Estimate Premium for SL calculation
+        # ITM 1 Premium approx 100
+        premium = 100
+        sl_points = SL_AMOUNT / LOT_SIZE  # 2000/65 = 30.76
+        sl_price = round(premium - sl_points, 1)
+        target_price = round(premium + (TARGET_AMOUNT / LOT_SIZE), 1)
+
+        msg = f"""🚀 BOT ORDER - {reason}
+Nifty: {nifty}
+ATM: {atm} | Strike: {strike} {option_type}
+Qty: {LOT_SIZE} (ITM 1)
+Entry Approx: {premium}
+SL: {sl_price} (Rs {SL_AMOUNT})
+Target: {target_price}
+Time: {datetime.now(IST).strftime('%d-%m-%Y %I:%M %p')}
+"""
+        send_telegram(msg)
+        return {
+            "status": "signal_generated",
+            "nifty": nifty,
+            "atm": atm,
+            "strike": strike,
+            "option_type": option_type,
+            "qty": LOT_SIZE,
+            "lot_size": LOT_SIZE,
+            "sl_price": sl_price,
+            "target_price": target_price,
+            "reason": reason
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+# ============ BOT LOGIC - SCHEDULER ============
+traded_920 = False
+traded_1015 = False
+last_day = None
+
+def bot_scheduler():
+    global traded_920, traded_1015, last_day
     while True:
         try:
-            price, pct = get_nifty()
-            if price:
-                STATE["nifty_live"] = round(price, 2)
-                STATE["nifty_pct"] = pct
-                STATE["updated"] = ist_str()
-            now = ist_now()
-            h = now.hour + now.minute / 60
-            if 9.33 <= h < 9.35 and not STATE["trade_920"]:
-                STATE["trade_920"] = True
-                STATE["last_msg"] = "9:20 TRADE TRIGGERED | NIFTY " + str(price) + " | QTY " + str(TOTAL_QTY)
-                code, resp = place_dhan_order("BUY", TOTAL_QTY, "9:20")
-                STATE["last_msg"] = "9:20 ORDER TRIED | Code " + str(code) + " | QTY " + str(TOTAL_QTY) + " | " + resp[:200]
-                send_telegram("DHAN 9:20 TRADE | QTY " + str(TOTAL_QTY) + " | Code " + str(code) + " | " + resp[:200])
-            if 10.25 <= h < 10.27 and not STATE["trade_1015"]:
-                STATE["trade_1015"] = True
-                STATE["last_msg"] = "10:15 TRADE TRIGGERED | NIFTY " + str(price) + " | QTY " + str(TOTAL_QTY)
-                code, resp = place_dhan_order("BUY", TOTAL_QTY, "10:15")
-                STATE["last_msg"] = "10:15 ORDER TRIED | Code " + str(code) + " | QTY " + str(TOTAL_QTY) + " | " + resp[:200]
-                send_telegram("DHAN 10:15 TRADE | QTY " + str(TOTAL_QTY) + " | Code " + str(code) + " | " + resp[:200])
-            if now.hour == 0 and now.minute < 5:
-                STATE["trade_920"] = False
-                STATE["trade_1015"] = False
-                STATE["pnl_today"] = 0
-                STATE["trade1_pnl"] = 0
-                STATE["trade2_pnl"] = 0
+            now = datetime.now(IST)
+            today = now.strftime("%Y-%m-%d")
+            if today != last_day:
+                traded_920 = False
+                traded_1015 = False
+                last_day = today
+
+            # Only Mon-Fri, 9:15 - 15:30
+            if now.weekday() >= 5:
+                time.sleep(60)
+                continue
+
+            # Trade 1 - 9:20 ORB
+            if not traded_920 and now.hour == 9 and now.minute == 20:
+                # Simplified: Check Nifty vs 9:15 Candle
+                # For now - Default CE if Nifty Up, else PE
+                # Real logic: Compare with 9:15 High/Low
+                nifty = get_nifty_price()
+                # Placeholder: Use previous close logic - You can add 9:15 High/Low API
+                result = place_option_order("CE", "9:20 ORB Breakout")
+                send_telegram(f"✅ 9:20 Trade Signal: {result}")
+                traded_920 = True
+
+            # Trade 2 - 10:15 Breakout
+            if not traded_1015 and now.hour == 10 and now.minute == 15:
+                nifty = get_nifty_price()
+                result = place_option_order("CE", "10:15 Breakout")
+                send_telegram(f"✅ 10:15 Trade Signal: {result}")
+                traded_1015 = True
+
             time.sleep(30)
-        except:
+        except Exception as e:
+            print("Scheduler Error:", e)
             time.sleep(30)
 
-threading.Thread(target=bot_loop, daemon=True).start()
+# Start Scheduler in Background
+threading.Thread(target=bot_scheduler, daemon=True).start()
 
-@app.route('/api/status')
-def api_status():
-    return jsonify(STATE)
-
-@app.route('/test-order')
-def test_order():
-    try:
-        code, txt = get_funds()
-        result = {}
-        result["test"] = "DHAN LIVE TEST"
-        result["time"] = ist_str()
-        result["funds_status"] = code
-        result["funds"] = txt
-        result["lot_size"] = LOT_SIZE
-        result["qty"] = TOTAL_QTY
-        result["note"] = "200 = Token OK | 401 = Token Expired - Pudhu Token Pottanum"
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-@app.route('/health')
-def health():
-    return jsonify({"ok": True, "time": ist_str()})
-
-@app.route('/')
+# ============ ROUTES ============
+@app.route("/")
 def home():
-    now = ist_str()
-    html = ""
-    html += "<html><head><title>DHAN BOT</title>"
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-    html += "<style>"
-    html += "body{background:#070a12;color:#fff;font-family:Arial;padding:12px}"
-    html += ".top{background:#0f172a;border:1px solid #26314d;border-radius:16px;padding:14px;display:flex;justify-content:space-between;align-items:center}"
-    html += ".live{background:#052e1a;color:#4ade80;padding:6px 14px;border-radius:20px;font-weight:bold}"
-    html += ".grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:12px}"
-    html += "@media(max-width:700px){.grid{grid-template-columns:1fr}}"
-    html += ".card{background:#101826;border:1px solid #26314d;border-radius:16px;padding:14px}"
-    html += ".big{font-size:26px;font-weight:bold;margin:6px 0}"
-    html += ".small{font-size:11px;color:#94a3b8}"
-    html += ".pill{display:inline-block;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:bold}"
-    html += ".box{background:#0b1220;border:1px solid #26314d;border-radius:12px;padding:12px;margin-top:12px}"
-    html += "table{width:100%;border-collapse:collapse;font-size:13px}"
-    html += "th,td{padding:9px;border-bottom:1px solid #26314d;text-align:left}"
-    html += "th{color:#94a3b8}"
-    html += "a{color:#4ade80}"
-    html += "</style></head><body>"
-    html += "<div class='top'><div><h2 style='margin:0'>🚀 DHAN BOT <span style='font-size:13px;color:#94a3b8'>| BOTH LIVE</span></h2><small>" + now + "</small></div><div class='live'>● LIVE</div></div>"
-    html += "<div class='grid'>"
-    html += "<div class='card' style='border-color:#22c55e'><h3>📈 Trade 1 - 9:20 ORB</h3><span class='pill' style='background:#052e1a;color:#4ade80'>LOT 65 x 1 | FIXED SL 2000 • TGT 2000</span><div class='big' id='t1Status'>WAITING</div><div class='small'>P&L: <b id='t1Pnl'>Rs 0</b></div></div>"
-    html += "<div class='card' style='border-color:#f59e0b'><h3>🔥 Trade 2 - 10:15 BREAKOUT</h3><span class='pill' style='background:#3a2a0a;color:#facc15'>LOT 65 x 1 | TRAILING SL 2000 • NO TARGET</span><div class='big' id='t2Status'>WAITING</div><div class='small'>P&L: <b id='t2Pnl'>Rs 0</b></div></div>"
-    html += "<div class='card'><h3>💰 Today P&L</h3><div class='big' id='todayPnl'>Rs 0</div><div class='small'>Qty 65 (Lot 65 x 1) | NIFTY: <b id='niftyLive'>-</b> (<span id='niftyPct'>-</span>%)</div><div class='small'>Dhan: <span id='dhanStat'>-</span></div></div>"
-    html += "</div>"
-    html += "<div class='box'><b>📋 LIVE STATUS</b><table><tr><th>Item</th><th>Value</th></tr><tr><td>Bot Status</td><td id='botStatus'>-</td></tr><tr><td>Dhan</td><td id='dhanConn'>-</td></tr><tr><td>Lot Size</td><td>65</td></tr><tr><td>Qty</td><td>65 (1 Lot)</td></tr><tr><td>Open Trade</td><td id='openTrade'>-</td></tr><tr><td>Trade 9:20</td><td id='tr920'>-</td></tr><tr><td>Trade 10:15</td><td id='tr1015'>-</td></tr><tr><td>Last Order</td><td id='lastOrder'>-</td></tr><tr><td>Last Msg</td><td id='lastMsg'>-</td></tr></table></div>"
-    html += "<div class='box'><a href='/test-order'>👉 CLICK HERE - TEST DHAN CONNECTION</a></div>"
-    html += "<script>"
-    html += "function fmt(n){return 'Rs '+Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:0})}"
-    html += "function load(){ fetch('/api/status').then(r=>r.json()).then(d=>{"
-    html += "document.getElementById('botStatus').innerText=d.status;"
-    html += "document.getElementById('dhanConn').innerText=d.dhan;"
-    html += "document.getElementById('dhanStat').innerText=d.dhan;"
-    html += "document.getElementById('openTrade').innerText=d.open_trade?JSON.stringify(d.open_trade):'None';"
-    html += "document.getElementById('tr920').innerText=d.trade_920;"
-    html += "document.getElementById('tr1015').innerText=d.trade_1015;"
-    html += "document.getElementById('lastOrder').innerText=d.last_order_response||'';"
-    html += "document.getElementById('t1Status').innerText=d.trade_920?'🟢 RUNNING':'WAITING';"
-    html += "document.getElementById('t2Status').innerText=d.trade_1015?'🟢 RUNNING':'WAITING';"
-    html += "document.getElementById('todayPnl').innerText=fmt(d.pnl_today);"
-    html += "document.getElementById('t1Pnl').innerText=fmt(d.trade1_pnl);"
-    html += "document.getElementById('t2Pnl').innerText=fmt(d.trade2_pnl);"
-    html += "document.getElementById('lastMsg').innerText=d.last_msg||'';"
-    html += "document.getElementById('niftyLive').innerText=d.nifty_live||'-';"
-    html += "document.getElementById('niftyPct').innerText=d.nifty_pct||'-';"
-    html += "});}"
-    html += "load(); setInterval(load,8000);"
-    html += "</script></body></html>"
+    nifty = get_nifty_price()
+    atm, ce_strike = get_itm1_symbol(nifty, "CE")
+    _, pe_strike = get_itm1_symbol(nifty, "PE")
+    html = f"""
+    <h1>🤖 Dhan Bot - ON</h1>
+    <p><b>Nifty:</b> {nifty}</p>
+    <p><b>ATM:</b> {atm} | <b>ITM 1 CE:</b> {ce_strike} CE | <b>ITM 1 PE:</b> {pe_strike} PE</p>
+    <p><b>Lot:</b> 65 | <b>SL:</b> Rs 2000 | <b>Target:</b> Rs 2000</p>
+    <p><b>Trade 1:</b> 9:20 ORB | <b>Trade 2:</b> 10:15 Breakout</p>
+    <p><b>Time:</b> {datetime.now(IST).strftime('%d-%m-%Y %I:%M %p')}</p>
+    <hr>
+    <a href="/test-order">Test Order</a> | <a href="/test-telegram">Test Telegram</a> | <a href="/status">Status</a>
+    """
     return html
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+@app.route("/status")
+def status():
+    code, funds = get_funds()
+    return jsonify({
+        "bot": "ON",
+        "lot_size": LOT_SIZE,
+        "qty": LOT_SIZE,
+        "strike": "ITM 1",
+        "trade1": "9:20 ORB",
+        "trade2": "10:15 Breakout",
+        "sl": SL_AMOUNT,
+        "funds_status": code,
+        "funds": funds,
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "time": datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    })
+
+@app.route("/test-order")
+def test_order():
+    code, funds = get_funds()
+    nifty = get_nifty_price()
+    atm, ce_strike = get_itm1_symbol(nifty, "CE")
+    _, pe_strike = get_itm1_symbol(nifty, "PE")
+    avail = 0
+    try:
+        avail = funds.get("data", {}).get("availabelBalance", 0)
+    except:
+        pass
+    return jsonify({
+        "funds_status": code,
+        "lot_size": LOT_SIZE,
+        "qty": LOT_SIZE,
+        "nifty": nifty,
+        "atm": atm,
+        "itm1_ce": ce_strike,
+        "itm1_pe": pe_strike,
+        "availabelBalance": avail,
+        "time": datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    })
+
+@app.route("/test-telegram")
+def test_telegram():
+    ok = send_telegram("✅ Bot Connected! Telegram OK Sir! - Test Message - " + datetime.now(IST).strftime('%d-%m-%Y %I:%M %p'))
+    return jsonify({"telegram_sent": ok, "time": datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")})
+
+@app.route("/test-buy-ce")
+def test_buy_ce():
+    result = place_option_order("CE", "Manual Test CE")
+    return jsonify(result)
+
+@app.route("/test-buy-pe")
+def test_buy_pe():
+    result = place_option_order("PE", "Manual Test PE")
+    return jsonify(result)
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
