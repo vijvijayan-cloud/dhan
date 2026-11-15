@@ -32,6 +32,8 @@ TRADE2_TRAILING = True
 
 TRAIL_STEP = 500
 TRAIL_MIN_PROFIT = 500
+# Next Expiry - Thursday
+EXPIRY_DATE = "2026-11-19"
 
 STATE = {
     "dhan": "Not Checked",
@@ -114,8 +116,10 @@ def get_nifty():
 
 def get_option_security_id(strike, option_type):
     try:
+        # ✅ FIXED - Expiry 0 Illa - Correct Expiry Date
         r = requests.post(f"{DHAN_BASE}/v2/optionchain", headers=dhan_headers(),
-            json={"UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I", "Expiry": "0"}, timeout=10)
+            json={"UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I", "Expiry": EXPIRY_DATE}, timeout=10)
+        print("OPTIONCHAIN:", r.status_code, r.text[:500])
         data = r.json().get("data", {})
         oc = data.get("oc", {})
         for k, v in oc.items():
@@ -125,22 +129,23 @@ def get_option_security_id(strike, option_type):
                     return str(side.get("securityId", ""))
             except: pass
         return None
-    except:
+    except Exception as e:
+        print("OPT ID ERR:", e)
         return None
 
-def place_order(security_id, side, qty, order_type="MARKET", price=0, trigger=0):
+def place_order(security_id, side, qty, order_type="MARKET", price=0, trigger=0, seg="NSE_FNO"):
     try:
         payload = {
             "dhanClientId": DHAN_CLIENT_ID,
-            "transactionType": side, "exchangeSegment": "NSE_FNO",
+            "transactionType": side, "exchangeSegment": seg,
             "productType": "INTRADAY", "orderType": order_type,
             "validity": "DAY", "securityId": str(security_id),
             "quantity": int(qty), "price": price, "triggerPrice": trigger,
             "afterMarketOrder": False, "amoTime": "OPEN"
         }
         r = requests.post(f"{DHAN_BASE}/v2/orders", headers=dhan_headers(), json=payload, timeout=10)
-        print("ORDER:", r.status_code, r.text[:500])
-        return r.status_code in [200, 201], r.text[:500]
+        print("ORDER:", r.status_code, r.text[:800])
+        return r.status_code in [200, 201], r.text[:800]
     except Exception as e:
         return False, str(e)
 
@@ -286,24 +291,50 @@ def health():
 def status_page():
     return jsonify({"dhan_status": STATE["funds_status"], "funds": STATE["funds"], "nifty": STATE["nifty_live"], "dhan": STATE["dhan"], "token_set": bool(DHAN_ACCESS_TOKEN)})
 
-# ===== 🧪 TEST ORDER - Innaiku Test Panna =====
+# ===== 🧪 TEST ORDER - Option Chain Vazhi =====
 @app.route('/test-order')
 def test_order():
-    # SAFE TEST - 1 Qty Mattum - 65 Illa
     price, _ = get_nifty()
-    # Sunday Market Close-na Nifty 0 Varum - Appo 26000 Default
     used_price = price if price else 26000
     atm = round(used_price / 50) * 50
-    strike = atm - 50  # ITM 1
+    strike = atm - 50
     sec_id = get_option_security_id(strike, "CE")
     if not sec_id:
         STATE["last_test"] = f"FAILED - Option ID Illa Strike {strike}"
         send_telegram(f"🧪 TEST FAILED - Option ID Illa Strike {strike}")
-        return jsonify({"test": "FAILED", "reason": "Option ID Kedaikala - Market Close / Expiry Issue", "strike": strike, "nifty_used": used_price, "note": "Market Close-na Option Chain Kedaikaadhu - Normal"})
-    ok, resp = place_order(sec_id, "BUY", 1)  # 1 Qty Mattum
+        return jsonify({"test": "FAILED", "reason": "Option ID Kedaikala - Market Close / Expiry Issue", "strike": strike, "nifty_used": used_price, "note": "Market Close-na Option Chain Kedaikaadhu - Normal - /test-order-direct Try Pannunga"})
+    ok, resp = place_order(sec_id, "BUY", 1)
     STATE["last_test"] = f"Strike {strike} CE Qty 1 - {'PLACED' if ok else 'REJECTED'} - {resp[:200]}"
     send_telegram(f"🧪 TEST ORDER\nStrike {strike} CE Qty 1\nNifty {used_price}\nResult: {resp[:200]}\nDhan Orders la Check Pannunga Sir!")
     return jsonify({"test": "PLACED" if ok else "REJECTED - Paravailla, Dhan Orders la Check Pannunga", "strike": strike, "sec_id": sec_id, "qty": 1, "dhan_response": resp, "nifty_used": used_price})
+
+# ===== 🧪 TEST ORDER DIRECT - Option Chain Illama - Sunday-kku =====
+@app.route('/test-order-direct')
+def test_order_direct():
+    try:
+        r = requests.post(f"{DHAN_BASE}/v2/optionchain", headers=dhan_headers(),
+            json={"UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I", "Expiry": EXPIRY_DATE}, timeout=10)
+        print("OPTION CHAIN DIRECT:", r.status_code, r.text[:800])
+        sec_id = None
+        try:
+            oc = r.json().get("data", {}).get("oc", {})
+            for k, v in oc.items():
+                if abs(float(k) - 25950) < 1:
+                    sec_id = str(v.get("ce", {}).get("securityId", ""))
+                    break
+        except: pass
+        if not sec_id:
+            # Equity Test - RELIANCE 2885 - Dhan API Reach Aacha-nu Paakka
+            ok, resp = place_order("2885", "BUY", 1, seg="NSE_EQ")
+            STATE["last_test"] = f"DIRECT EQUITY TEST - {resp[:200]}"
+            send_telegram(f"🧪 DIRECT TEST - Equity\nRELIANCE 1 Qty\nDhan Response: {resp[:200]}")
+            return jsonify({"test": "DIRECT_EQUITY", "note": "Option Chain Sunday Illa - Adhaala Equity la Test Pannom - Dhan Response Paanga", "dhan_response": resp, "dhan_orders_check": "Dhan App -> Orders la Paanga - Rejected nu Theriyum"})
+        ok, resp = place_order(sec_id, "BUY", 1)
+        STATE["last_test"] = f"Strike 25950 CE Qty 1 - {resp[:200]}"
+        send_telegram(f"🧪 TEST ORDER DIRECT\nStrike 25950 CE Qty 1 Sec {sec_id}\nResult: {resp[:200]}")
+        return jsonify({"test": "PLACED" if ok else "REJECTED", "strike": 25950, "sec_id": sec_id, "dhan_response": resp})
+    except Exception as e:
+        return jsonify({"test": "ERROR", "error": str(e)})
 
 @app.route('/test-telegram')
 def test_telegram():
@@ -333,17 +364,17 @@ def home():
     table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
     th,td{padding:9px;border-bottom:1px solid #26314d;text-align:left} th{color:#94a3b8}
     .btn{display:inline-block;background:#22c55e;color:#000;padding:10px 18px;border-radius:10px;font-weight:bold;text-decoration:none;margin:4px}
-    .btn2{background:#f59e0b}
+    .btn2{background:#f59e0b} .btn3{background:#38bdf8}
     </style></head><body>
     <div class='top'><div><h2>🚀 DHAN BOT <span style='font-size:13px;color:#94a3b8'>| BOTH TRAILING</span></h2><small>""" + now + """ | Auto Refresh 8s</small></div><div class='live' id='liveDot'>● LIVE</div></div>
-    <div class='box' style='text-align:center'><b>🧪 TEST BUTTONS</b><br><br><a class='btn' href='/test-order'>🧪 TEST ORDER - 1 Qty Place Pannu</a> <a class='btn btn2' href='/test-telegram'>📩 TEST TELEGRAM</a><div class='small' style='margin-top:8px'>Test Order - 1 Qty Mattum - Reject Aanaalum Paravailla - Dhan Orders la Check Pannunga</div><div class='small' id='lastTest' style='margin-top:6px;color:#facc15'>-</div></div>
+    <div class='box' style='text-align:center'><b>🧪 TEST BUTTONS</b><br><br><a class='btn' href='/test-order'>🧪 TEST ORDER - 1 Qty</a> <a class='btn btn3' href='/test-order-direct'>🧪 TEST DIRECT - Sunday-kku</a> <a class='btn btn2' href='/test-telegram'>📩 TEST TELEGRAM</a><div class='small' style='margin-top:8px'>Test Order - 1 Qty Mattum - Reject Aanaalum Paravailla - Dhan Orders la Check Pannunga</div><div class='small' id='lastTest' style='margin-top:6px;color:#facc15'>-</div></div>
     <div class='grid'>
       <div class='card' style='border-color:#22c55e'><h3>📈 Trade 1 - 9:20 ORB</h3><span class='pill' style='background:#052e1a;color:#4ade80'>TRAILING SL 2000 • NO TARGET</span><div class='big' id='t1Status'>WAITING</div><div class='small'>Trail SL: <b id='t1Trail'>-</b> | High: <b id='t1High'>-</b></div><div class='small' style='margin-top:6px'>P&L: <b id='t1Pnl' class='green'>Rs 0</b></div></div>
       <div class='card' style='border-color:#f59e0b'><h3>🔥 Trade 2 - 10:15 BREAKOUT</h3><span class='pill' style='background:#3a2a0a;color:#facc15'>TRAILING SL 2000 • NO TARGET</span><div class='big' id='t2Status'>WAITING</div><div class='small'>Trail SL: <b id='t2Trail'>-</b> | High: <b id='t2High'>-</b></div><div class='small' style='margin-top:6px'>P&L: <b id='t2Pnl' class='green'>Rs 0</b></div></div>
       <div class='card'><h3>💰 Today P&L</h3><div class='big' id='todayPnl'>Rs 0</div><div class='small'>Qty 65 | NIFTY: <b id='niftyLive'>-</b></div><div class='small' style='margin-top:6px'>Funds: <b id='fundsVal'>-</b> | Dhan: <span id='dhanStat'>-</span></div></div>
     </div>
     <div class='box'><b>📋 LIVE STATUS</b><table><tr><th>Item</th><th>Value</th></tr><tr><td>Bot Status</td><td id='botStatus'>-</td></tr><tr><td>Dhan Connection</td><td id='dhanConn'>-</td></tr><tr><td>Open Trade</td><td id='openTrade'>-</td></tr><tr><td>Trade 9:20</td><td id='tr920'>-</td></tr><tr><td>Trade 10:15</td><td id='tr1015'>-</td></tr><tr><td>Last Test</td><td id='lastTest2'>-</td></tr><tr><td>Last Msg</td><td id='lastMsg'>-</td></tr></table></div>
-    <div class='box'><b>⚙️ CONFIG</b><table><tr><th>Trade</th><th>Time</th><th>SL</th><th>Target</th><th>Trailing</th></tr><tr><td>Trade 1</td><td>9:20</td><td>2000</td><td>No Target</td><td>Yes ✅</td></tr><tr><td>Trade 2</td><td>10:15</td><td>2000</td><td>No Target</td><td>Yes ✅</td></tr></table><div class='small' style='margin-top:8px'>Qty: 65 | Max Loss: 2000 per Trade | No Time Limit - Trail Thaan Exit | Trail Step: Rs 500 Profit-ku SL Mela Pogum</div></div>
+    <div class='box'><b>⚙️ CONFIG</b><table><tr><th>Trade</th><th>Time</th><th>SL</th><th>Target</th><th>Trailing</th></tr><tr><td>Trade 1</td><td>9:20</td><td>2000</td><td>No Target</td><td>Yes ✅</td></tr><tr><td>Trade 2</td><td>10:15</td><td>2000</td><td>No Target</td><td>Yes ✅</td></tr></table><div class='small' style='margin-top:8px'>Qty: 65 | Max Loss: 2000 per Trade | No Time Limit - Trail Thaan Exit | Trail Step: Rs 500 Profit-ku SL Mela Pogum | Expiry: 19-11-2026</div></div>
     <script>
     function fmt(n){return 'Rs '+Number(n||0).toLocaleString('en-IN',{maximumFractionDigits:0})}
     function load(){ fetch('/api/status').then(r=>r.json()).then(d=>{ document.getElementById('botStatus').innerText=d.status; document.getElementById('dhanConn').innerText=d.dhan; document.getElementById('dhanStat').innerText=d.dhan; document.getElementById('fundsVal').innerText=fmt(d.funds); document.getElementById('openTrade').innerText=d.open_trade?JSON.stringify(d.open_trade):'None'; document.getElementById('tr920').innerText=d.trade_920; document.getElementById('tr1015').innerText=d.trade_1015; document.getElementById('t1Status').innerText=d.trade1_status||'WAITING'; document.getElementById('t2Status').innerText=d.trade2_status||'WAITING'; document.getElementById('t1Trail').innerText=d.trade1_trail_sl||'-'; document.getElementById('t2Trail').innerText=d.trade2_trail_sl||'-'; document.getElementById('t1High').innerText=d.trade1_high||'-'; document.getElementById('t2High').innerText=d.trade2_high||'-'; document.getElementById('todayPnl').innerText=fmt(d.pnl_today); document.getElementById('todayPnl').style.color=(d.pnl_today||0)>=0?'#22c55e':'#ef4444'; document.getElementById('t1Pnl').innerText=fmt(d.trade1_pnl); document.getElementById('t2Pnl').innerText=fmt(d.trade2_pnl); document.getElementById('lastMsg').innerText=d.last_msg||''; document.getElementById('lastTest').innerText='Last Test: '+(d.last_test||'No Test Yet'); document.getElementById('lastTest2').innerText=d.last_test||'No Test Yet'; document.getElementById('niftyLive').innerText=d.nifty_live||'-'; document.getElementById('liveDot').innerText=d.live?'● LIVE':'○ OFFLINE'; }); }
