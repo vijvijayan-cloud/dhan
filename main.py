@@ -79,11 +79,11 @@ def get_funds():
     try:
         headers = get_dhan_headers()
         r = requests.get(
-            "https://api.dhan.co/v2/funds",
+            "https://api.dhan.co/v2/fundlimit",
             headers=headers,
             timeout=10
         )
-        return r.status_code, r.text[:500]
+        return r.status_code, r.text[:800]
     except Exception as e:
         return 0, str(e)
 
@@ -162,7 +162,7 @@ def test_order():
         result["time"] = ist_str()
         result["funds_status"] = code
         result["funds"] = txt
-        result["note"] = "200 = Token OK | 401 = Token Expired - Pudhu Token Pottanum | 403 = IP Whitelist Problem"
+        result["note"] = "200 = Token OK ✅ | 401 = Token Expired - Pudhu Token Pottanum | 403 = IP Whitelist Problem"
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)})
